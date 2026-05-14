@@ -11,3 +11,4 @@ uploads/
 dist/
 build/
 .vercel/
+.vercel
