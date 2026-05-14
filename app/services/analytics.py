@@ -3,6 +3,25 @@ import numpy as np
 from pathlib import Path
 
 
+# Only load columns we actually need — skipping unused columns saves memory and speeds up parsing
+NEEDED_COLUMNS = [
+    "payment_status",
+    "payment_source",
+    "city",
+    "country_code",
+    "card_brand",
+    "proposed_at",
+]
+
+# Use categorical dtype for low-cardinality string columns (big speedup for groupby)
+DTYPE_MAP = {
+    "payment_status": "category",
+    "payment_source": "category",
+    "card_brand": "category",
+    "country_code": "category",
+}
+
+
 class TransactionAnalytics:
     """
     Core analytics engine — reads a CSV/Excel file and produces
@@ -12,9 +31,21 @@ class TransactionAnalytics:
     def __init__(self, file_path: str):
         ext = Path(file_path).suffix.lower()
         if ext == ".csv":
-            self.df = pd.read_csv(file_path, low_memory=False)
+            self.df = pd.read_csv(
+                file_path,
+                usecols=lambda c: c in NEEDED_COLUMNS,
+                dtype=DTYPE_MAP,
+                low_memory=False,
+            )
         elif ext in (".xlsx", ".xls"):
-            self.df = pd.read_excel(file_path)
+            self.df = pd.read_excel(
+                file_path,
+                usecols=lambda c: c in NEEDED_COLUMNS,
+            )
+            # Apply categorical dtypes after reading Excel
+            for col, dtype in DTYPE_MAP.items():
+                if col in self.df.columns:
+                    self.df[col] = self.df[col].astype(dtype)
         else:
             raise ValueError(f"Unsupported file type: {ext}")
 
@@ -25,7 +56,8 @@ class TransactionAnalytics:
         df["proposed_at"] = pd.to_datetime(df["proposed_at"], errors="coerce")
         df["hour"] = df["proposed_at"].dt.hour
         df["month"] = df["proposed_at"].dt.to_period("M").astype(str)
-        df["city_normalized"] = df["city"].str.strip().str.upper()
+        # Normalize city for consistent grouping
+        df["city_normalized"] = df["city"].str.strip().str.upper().astype("category")
         self.df = df
 
     def summary(self) -> dict:
@@ -37,13 +69,13 @@ class TransactionAnalytics:
             "success": int(status_counts.get("success", 0)),
             "failed": int(status_counts.get("failed", 0)),
             "pending": int(status_counts.get("pending", 0)),
-            "success_rate": round(status_counts.get("success", 0) / total * 100, 2),
-            "failure_rate": round(status_counts.get("failed", 0) / total * 100, 2),
+            "success_rate": round(status_counts.get("success", 0) / total * 100, 2) if total else 0,
+            "failure_rate": round(status_counts.get("failed", 0) / total * 100, 2) if total else 0,
         }
 
     def by_payment_source(self) -> list[dict]:
         df = self.df
-        grouped = df.groupby("payment_source")["payment_status"].value_counts().unstack(fill_value=0)
+        grouped = df.groupby("payment_source", observed=True)["payment_status"].value_counts().unstack(fill_value=0)
         grouped["total"] = grouped.sum(axis=1)
         if "failed" in grouped.columns:
             grouped["fail_rate"] = (grouped["failed"] / grouped["total"] * 100).round(2)
@@ -56,7 +88,7 @@ class TransactionAnalytics:
         df = self.df
         city_fail = (
             df[df["payment_status"] == "failed"]
-            .groupby("city_normalized")
+            .groupby("city_normalized", observed=True)
             .size()
             .sort_values(ascending=False)
             .head(top_n)
@@ -69,7 +101,7 @@ class TransactionAnalytics:
         df = self.df
         country_fail = (
             df[df["payment_status"] == "failed"]
-            .groupby("country_code")
+            .groupby("country_code", observed=True)
             .size()
             .sort_values(ascending=False)
             .head(top_n)
@@ -81,7 +113,7 @@ class TransactionAnalytics:
     def by_hour(self) -> list[dict]:
         df = self.df
         hourly = (
-            df.groupby(["hour", "payment_status"])
+            df.groupby(["hour", "payment_status"], observed=True)
             .size()
             .unstack(fill_value=0)
             .reset_index()
@@ -91,7 +123,7 @@ class TransactionAnalytics:
     def by_month(self) -> list[dict]:
         df = self.df
         monthly = (
-            df.groupby(["month", "payment_status"])
+            df.groupby(["month", "payment_status"], observed=True)
             .size()
             .unstack(fill_value=0)
             .reset_index()
@@ -100,9 +132,10 @@ class TransactionAnalytics:
 
     def by_card_brand(self) -> list[dict]:
         df = self.df
+        mask = df["card_brand"].notna() & (df["card_brand"].astype(str) != "NULL")
         brands = (
-            df[df["card_brand"].notna() & (df["card_brand"] != "NULL")]
-            .groupby("card_brand")["payment_status"]
+            df[mask]
+            .groupby("card_brand", observed=True)["payment_status"]
             .value_counts()
             .unstack(fill_value=0)
             .reset_index()
